@@ -37,7 +37,7 @@ jobs:
           gradle-version: '8.10.2'
           cache-provider: basic
 
-      - name: Extract ZIP, test and build APK
+      - name: Extract ZIP, apply dependency compatibility fix, test and build APK
         shell: bash
         run: |
           set -euo pipefail
@@ -52,8 +52,23 @@ jobs:
             find "$EXTRACT_DIR" -maxdepth 4 -type f | head -100
             exit 1
           fi
-          test -f "$PROJECT_DIR/app/build.gradle.kts" || { echo "::error::app/build.gradle.kts is missing."; exit 1; }
+          BUILD_FILE="$PROJECT_DIR/app/build.gradle.kts"
+          test -f "$BUILD_FILE" || { echo "::error::app/build.gradle.kts is missing."; exit 1; }
           test -d "$PROJECT_DIR/app/src" || { echo "::error::app/src folder is missing."; exit 1; }
+          python3 - "$BUILD_FILE" <<'PY'
+          import pathlib, re, sys
+          p = pathlib.Path(sys.argv[1])
+          text = p.read_text(encoding="utf-8")
+          pattern = r"com\.squareup\.okhttp3:okhttp(?:-android)?:5\.5\.1"
+          updated, count = re.subn(pattern, "com.squareup.okhttp3:okhttp:4.12.1", text)
+          if count == 0:
+              print("Could not find the expected OkHttp 5.5.1 dependency. Lines mentioning okhttp:")
+              for line in text.splitlines():
+                  if "okhttp" in line.lower(): print(line)
+              raise SystemExit("Dependency patch did not apply; stopping to avoid a misleading build.")
+          p.write_text(updated, encoding="utf-8")
+          print(f"Updated {count} OkHttp dependency declaration(s) to 4.12.1")
+          PY
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           cd "$PROJECT_DIR"
           gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug --stacktrace
