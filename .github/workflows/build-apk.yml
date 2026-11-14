@@ -4,7 +4,6 @@ on:
   push:
     paths:
       - 'NexDPI-independent-source-proxy.zip'
-      - '.github/workflows/build-apk.yml'
   workflow_dispatch:
 
 permissions:
@@ -13,6 +12,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -23,13 +23,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK, NDK and CMake
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK platform 35
+      - name: Install Android build components
         run: |
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+          sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "platform-tools" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
 
       - name: Set up Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v6
@@ -37,7 +42,7 @@ jobs:
           gradle-version: '8.10.2'
           cache-provider: basic
 
-      - name: Extract ZIP, apply dependency compatibility fix, test and build APK
+      - name: Extract project and fetch pinned native engine
         shell: bash
         run: |
           set -euo pipefail
@@ -48,32 +53,31 @@ jobs:
           unzip -q "$ARCHIVE" -d "$EXTRACT_DIR"
           PROJECT_DIR="$(find "$EXTRACT_DIR" -type f -name settings.gradle.kts -print -quit | xargs -r dirname)"
           if [ -z "$PROJECT_DIR" ]; then
-            echo "::error::settings.gradle.kts was not found inside the ZIP archive."
+            echo "::error::settings.gradle.kts was not found inside the ZIP."
             find "$EXTRACT_DIR" -maxdepth 4 -type f | head -100
             exit 1
           fi
-          BUILD_FILE="$PROJECT_DIR/app/build.gradle.kts"
-          test -f "$BUILD_FILE" || { echo "::error::app/build.gradle.kts is missing."; exit 1; }
-          test -d "$PROJECT_DIR/app/src" || { echo "::error::app/src folder is missing."; exit 1; }
-          python3 - "$BUILD_FILE" <<'PY'
-          import pathlib, re, sys
-          p = pathlib.Path(sys.argv[1])
-          text = p.read_text(encoding="utf-8")
-          pattern = r"com\.squareup\.okhttp3:okhttp(?:-android)?:5\.5\.1"
-          updated, count = re.subn(pattern, "com.squareup.okhttp3:okhttp:4.12.1", text)
-          if count == 0:
-              print("Could not find the expected OkHttp 5.5.1 dependency. Lines mentioning okhttp:")
-              for line in text.splitlines():
-                  if "okhttp" in line.lower(): print(line)
-              raise SystemExit("Dependency patch did not apply; stopping to avoid a misleading build.")
-          p.write_text(updated, encoding="utf-8")
-          print(f"Updated {count} OkHttp dependency declaration(s) to 4.12.1")
-          PY
+          test -f "$PROJECT_DIR/app/build.gradle.kts"
+          test -f "$PROJECT_DIR/app/src/main/cpp/CMakeLists.txt"
+          BYEDPI_DIR="$PROJECT_DIR/app/src/main/cpp/byedpi"
+          git init "$BYEDPI_DIR"
+          git -C "$BYEDPI_DIR" remote add origin https://github.com/hufrea/byedpi.git
+          git -C "$BYEDPI_DIR" fetch --depth 1 origin e2684772fbda45f2ff4fc220922a010370534216
+          git -C "$BYEDPI_DIR" checkout --quiet FETCH_HEAD
+          test -f "$BYEDPI_DIR/LICENSE"
+          mkdir -p "$PROJECT_DIR/app/src/main/assets/licenses"
+          cp "$BYEDPI_DIR/LICENSE" "$PROJECT_DIR/app/src/main/assets/licenses/BYEDPI-MIT-LICENSE.txt"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Pinned hufrea/byedpi commit: e2684772fbda45f2ff4fc220922a010370534216"
+
+      - name: Build and run tests
+        shell: bash
+        run: |
+          set -euo pipefail
           cd "$PROJECT_DIR"
           gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug --stacktrace
 
-      - name: Upload APK
+      - name: Upload debug APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
